@@ -63,6 +63,7 @@ pub trait MakeServiceRef<Target, ReqBody>: self::sealed::Sealed<(Target, ReqBody
     fn make_service_ref(&mut self, target: &Target) -> Self::Future;
 }
 
+// 作为边界 对于所有可用的实现了Service trait
 impl<T, Target, E, ME, S, F, IB, OB> MakeServiceRef<Target, IB> for T
 where
     T: for<'a> Service<&'a Target, Error = ME, Response = S, Future = F>,
@@ -149,10 +150,12 @@ pub struct MakeServiceFn<F> {
     f: F,
 }
 
+/// 获得MakeServiceRef实现
 impl<'t, F, Ret, Target, Svc, MkErr> Service<&'t Target> for MakeServiceFn<F>
 where
     F: FnMut(&Target) -> Ret,
     Ret: Future<Output = Result<Svc, MkErr>>,
+    // MakeServiceRef: Into<Box<dyn StdError + Send + Sync>>
     MkErr: Into<Box<dyn StdError + Send + Sync>>,
 {
     type Error = MkErr;
