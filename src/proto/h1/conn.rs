@@ -114,6 +114,8 @@ where
         self.state.is_write_closed()
     }
 
+    /// 当reading处于 非init 时返回false。否则，
+    /// 当 Http1Transactiony为 Server时 否则 writing为 非init时返回 true
     pub(crate) fn can_read_head(&self) -> bool {
         match self.state.reading {
             Reading::Init => {

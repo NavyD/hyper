@@ -235,6 +235,7 @@ where
 
     fn poll_read_head(&mut self, cx: &mut task::Context<'_>) -> Poll<crate::Result<()>> {
         // can dispatch receive, or does it still care about, an incoming message?
+        // Server的实现将调用实现了tower_service::Service的ServiceFn一直返回Ready
         match ready!(self.dispatch.poll_ready(cx)) {
             Ok(()) => (),
             Err(()) => {
@@ -522,6 +523,7 @@ cfg_server! {
             if self.in_flight.is_some() {
                 Poll::Pending
             } else {
+                // 调用ServiceFn::poll_ready一直返回Ok
                 self.service.poll_ready(cx).map_err(|_e| {
                     // FIXME: return error value.
                     trace!("service closed");
