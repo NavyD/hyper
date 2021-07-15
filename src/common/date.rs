@@ -17,6 +17,8 @@ pub(crate) fn extend(dst: &mut Vec<u8>) {
     })
 }
 
+/// 对thread local变量CACHED 检查1s内的时间。如果超过1s则更新 cached bytes格式为标准
+/// 的http date header
 #[cfg(feature = "http1")]
 pub(crate) fn update() {
     CACHED.with(|cache| {

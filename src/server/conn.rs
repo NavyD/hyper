@@ -908,6 +908,13 @@ where
     B: HttpBody,
     E: ConnStreamExec<<S::Service as HttpService<Body>>::Future, B>,
 {
+    /// 1. 调用MakeServiceFn检查是否准备完成，其实现简单返回`Poll::Ready(Ok(()))`
+    /// 2. 接受连接得到读写的io
+    /// 3. 将io传入MakeServiceFn中注册的fn调用得到 一个Future：ServiceFn封装的用户定义user_fn：
+    /// （之前还要加上MakeServiceFn {）`async { ServiceFn { f: async {Ok(async user_fn)}} } }`。这里还没有调用user_fn，
+    /// 要想调用user_fn还要调用future得到ServiceFn，传入request调用ServiceFn::call得到封装user_fn(request)->resp的Future,
+    /// 再调用才能得到user_fn执行的结果。由make::make_service_fn(|conn| { async {Ok(user_fn)}})需要4次调用
+    /// 4. 封装io,ServiceFn,http实例 作为Connecting返回
     fn poll_next_(
         self: Pin<&mut Self>,
         cx: &mut task::Context<'_>,
@@ -948,6 +955,10 @@ where
 {
     type Output = Result<Connection<I, S, E>, FE>;
 
+    /// 执行Future::poll得到 `ServiceFn { f: async {Ok(async user_fn)}} }`，封装io与ServiceFn作为http连接处理。
+    /// 构造http server.
+    /// HttpService针对tower_service::Service有默认实现，而ServiceFn实现了tower_service::Service，
+    /// 即ServiceFn就是一个HttpService
     fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
         let mut me = self.project();
         let service = ready!(me.future.poll(cx))?;
@@ -980,6 +991,8 @@ where
     B: HttpBody,
     E: ConnStreamExec<<S::Service as HttpService<Body>>::Future, B>,
 {
+    /// 接受连接与对应的serviceFn封装为NewSvcTask future，并使用http.exec中定义的运行时运行这个future。
+    /// 之后不会阻塞，继续等待接受连接
     pub(super) fn poll_watch<W>(
         self: Pin<&mut Self>,
         cx: &mut task::Context<'_>,
@@ -1135,6 +1148,8 @@ pub(crate) mod spawn_all {
     {
         type Output = ();
 
+        /// 1. 得到封装了io与ServiceFn的Connection
+        /// 2. 调用UpgradeableConnection::poll
         fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
             // If it weren't for needing to name this type so the `Send` bounds
             // could be projected to the `Serve` executor, this could just be
@@ -1148,6 +1163,7 @@ pub(crate) mod spawn_all {
                             connecting,
                             watcher,
                         } => {
+                            // 得到封装io与servicefn的 http Connection
                             let res = ready!(connecting.poll(cx));
                             let conn = match res {
                                 Ok(conn) => conn,
@@ -1223,6 +1239,7 @@ mod upgrades {
 
         fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
             loop {
+                // 在protoserver上调用h1/h2 server poll
                 match ready!(Pin::new(self.inner.conn.as_mut().unwrap()).poll(cx)) {
                     Ok(proto::Dispatched::Shutdown) => return Poll::Ready(Ok(())),
                     #[cfg(feature = "http1")]

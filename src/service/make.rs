@@ -63,6 +63,7 @@ pub trait MakeServiceRef<Target, ReqBody>: self::sealed::Sealed<(Target, ReqBody
     fn make_service_ref(&mut self, target: &Target) -> Self::Future;
 }
 
+// 作为边界 对于所有可用的实现了Service trait
 impl<T, Target, E, ME, S, F, IB, OB> MakeServiceRef<Target, IB> for T
 where
     T: for<'a> Service<&'a Target, Error = ME, Response = S, Future = F>,
@@ -81,6 +82,7 @@ where
 
     type __DontNameMe = self::sealed::CantName;
 
+    // MakeServiceRef本身impl对于所有的tower_service::Service trait，其实现了
     fn poll_ready_ref(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), Self::MakeError>> {
         self.poll_ready(cx)
     }
@@ -149,10 +151,12 @@ pub struct MakeServiceFn<F> {
     f: F,
 }
 
+/// 获得MakeServiceRef实现
 impl<'t, F, Ret, Target, Svc, MkErr> Service<&'t Target> for MakeServiceFn<F>
 where
     F: FnMut(&Target) -> Ret,
     Ret: Future<Output = Result<Svc, MkErr>>,
+    // MakeServiceRef: Into<Box<dyn StdError + Send + Sync>>
     MkErr: Into<Box<dyn StdError + Send + Sync>>,
 {
     type Error = MkErr;
