@@ -25,12 +25,15 @@ pub(crate) trait Dispatch {
     type PollBody;
     type PollError;
     type RecvItem;
+    /// 执行用户函数future取得Response，转换为PollItem (head)与PollBody
     fn poll_msg(
         self: Pin<&mut Self>,
         cx: &mut task::Context<'_>,
     ) -> Poll<Option<Result<(Self::PollItem, Self::PollBody), Self::PollError>>>;
+    /// 构造出request并传入生成用户函数 future。并没有实际读取body
     fn recv_msg(&mut self, msg: crate::Result<(Self::RecvItem, Body)>) -> crate::Result<()>;
     fn poll_ready(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), ()>>;
+    /// 用户函数future已被构造时返回true
     fn should_poll(&self) -> bool;
 }
 
@@ -131,8 +134,10 @@ where
         cx: &mut task::Context<'_>,
         should_shutdown: bool,
     ) -> Poll<crate::Result<Dispatched>> {
+        // 更新线程本地 时间缓存，无需lock
         T::update_date();
 
+        // 完成http服务
         ready!(self.poll_loop(cx))?;
 
         if self.is_done() {
@@ -149,6 +154,7 @@ where
         }
     }
 
+    /// 读取request，调用用户定义future取得response，写入response完成http
     fn poll_loop(&mut self, cx: &mut task::Context<'_>) -> Poll<crate::Result<()>> {
         // Limit the looping on this connection, in case it is ready far too
         // often, so that other futures don't starve.
@@ -179,14 +185,17 @@ where
         task::yield_now(cx).map(|never| match never {})
     }
 
+    /// 完成 ruquest的读取，传入req生成用户future函数，等待用户fut主动从body channel中读取这里读取
+    /// 发送的body data
     fn poll_read(&mut self, cx: &mut task::Context<'_>) -> Poll<crate::Result<()>> {
         loop {
             if self.is_closing {
                 return Poll::Ready(Ok(()));
             } else if self.conn.can_read_head() {
                 ready!(self.poll_read_head(cx))?;
-            } else if let Some(mut body) = self.body_tx.take() {
+            } else if let Some(mut body) = self.body_tx.take() { // poll read head后读取body channels
                 if self.conn.can_read_body() {
+                    // 检查body是否可读
                     match body.poll_ready(cx) {
                         Poll::Ready(Ok(())) => (),
                         Poll::Pending => {
@@ -201,6 +210,7 @@ where
                             continue;
                         }
                     }
+                    // 读取body bytes 从Sender发送到Body.kind::Chan(data_rx)中接收
                     match self.conn.poll_read_body(cx) {
                         Poll::Ready(Some(Ok(chunk))) => match body.try_send_data(chunk) {
                             Ok(()) => {
@@ -224,15 +234,16 @@ where
                             body.send_error(crate::Error::new_body(e));
                         }
                     }
-                } else {
+                } else { // 这次连接body已读取完成，关闭body channel take()
                     // just drop, the body will close automatically
                 }
-            } else {
+            } else { // 连接完成
                 return self.conn.poll_read_keep_alive(cx);
             }
         }
     }
 
+    /// 检查ServiceFn准备就绪，开始读取conn为request生成用户future函数
     fn poll_read_head(&mut self, cx: &mut task::Context<'_>) -> Poll<crate::Result<()>> {
         // can dispatch receive, or does it still care about, an incoming message?
         // Server的实现将调用实现了tower_service::Service的ServiceFn一直返回Ready
@@ -247,6 +258,7 @@ where
         // dispatch is ready for a message, try to read one
         match ready!(self.conn.poll_read_head(cx)) {
             Some(Ok((mut head, body_len, wants))) => {
+                // body is channels
                 let body = match body_len {
                     DecodedLength::ZERO => Body::empty(),
                     other => {
@@ -261,6 +273,7 @@ where
                     debug_assert!(head.extensions.get::<OnUpgrade>().is_none(), "OnUpgrade already set");
                     head.extensions.insert(upgrade);
                 }
+                // 生成用户函数future到self.in_flight field
                 self.dispatch.recv_msg(Ok((head, body)))?;
                 Poll::Ready(Ok(()))
             }
@@ -286,6 +299,7 @@ where
         }
     }
 
+    /// 将response写入self.conn.io buffer中
     fn poll_write(&mut self, cx: &mut task::Context<'_>) -> Poll<crate::Result<()>> {
         loop {
             if self.is_closing {
@@ -373,6 +387,7 @@ where
         }
     }
 
+    /// 刷新conn.io buffer写入
     fn poll_flush(&mut self, cx: &mut task::Context<'_>) -> Poll<crate::Result<()>> {
         self.conn.poll_flush(cx).map_err(|err| {
             debug!("error writing: {}", err);
@@ -506,6 +521,7 @@ cfg_server! {
             ret
         }
 
+        /// 构造出request并传入生成用户函数 future
         fn recv_msg(&mut self, msg: crate::Result<(Self::RecvItem, Body)>) -> crate::Result<()> {
             let (msg, body) = msg?;
             let mut req = Request::new(body);

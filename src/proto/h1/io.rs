@@ -150,6 +150,7 @@ where
         }
     }
 
+    /// 从read_buf中解析出request headers相关信息
     pub(super) fn parse<S>(
         &mut self,
         cx: &mut task::Context<'_>,

@@ -32,6 +32,8 @@ type TrailersSender = oneshot::Sender<HeaderMap>;
 ///
 /// Note: To read the full body, use [`body::to_bytes`](crate::body::to_bytes)
 /// or [`body::aggregate`](crate::body::aggregate).
+///
+/// Body是一个包括了channels接收与发送数据的stream
 #[must_use = "streams do nothing unless polled"]
 pub struct Body {
     kind: Kind,

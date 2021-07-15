@@ -121,8 +121,7 @@ where
         self.state.is_write_closed()
     }
 
-    /// 当reading处于 非init 时返回false。否则，
-    /// 当 Http1Transactiony为 Server时 否则 writing为 非init时返回 true
+    /// 当reading为init且 是server时 或writing不是init时返回true
     pub(crate) fn can_read_head(&self) -> bool {
         match self.state.reading {
             Reading::Init => {
@@ -139,6 +138,7 @@ where
         }
     }
 
+    /// 当reading为被设置了Decoder的body,continue时返回true
     pub(crate) fn can_read_body(&self) -> bool {
         match self.state.reading {
             Reading::Body(..) | Reading::Continue(..) => true,
@@ -156,6 +156,7 @@ where
         read_buf.len() >= 24 && read_buf[..24] == *H2_PREFACE
     }
 
+    /// 解析出request headers信息。配置state keepalive，state reading根据content_length配置body decoder
     pub(super) fn poll_read_head(
         &mut self,
         cx: &mut task::Context<'_>,
@@ -163,6 +164,7 @@ where
         debug_assert!(self.can_read_head());
         trace!("Conn::read_head");
 
+        // got request headers
         let msg = match ready!(self.io.parse::<T>(
             cx,
             ParseContext {
@@ -191,6 +193,7 @@ where
         self.state.keep_alive &= msg.keep_alive;
         self.state.version = msg.head.version;
 
+        // upgrade header
         let mut wants = if msg.wants_upgrade {
             Wants::UPGRADE
         } else {
@@ -241,6 +244,7 @@ where
         }
     }
 
+    /// 从self.io buffer中解码读取出body bytes
     pub(crate) fn poll_read_body(
         &mut self,
         cx: &mut task::Context<'_>,
@@ -445,6 +449,7 @@ where
         self.maybe_notify(cx);
     }
 
+    /// 当writing==init时且 除了作为client reading==closed时 返回true
     pub(crate) fn can_write_head(&self) -> bool {
         if !T::should_read_first() {
             if let Reading::Closed = self.state.reading {
@@ -480,6 +485,7 @@ where
         }
     }
 
+    /// 将head body编码写入到self.io.buf中
     pub(crate) fn write_full_msg(&mut self, head: MessageHead<T::Outgoing>, body: B) {
         if let Some(encoder) =
             self.encode_head(head, Some(BodyLength::Known(body.remaining() as u64)))

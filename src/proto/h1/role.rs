@@ -58,6 +58,7 @@ macro_rules! maybe_panic {
     })
 }
 
+/// 在Http1Transaction实现Server中解析出request相关header信息
 pub(super) fn parse_headers<T>(
     bytes: &mut BytesMut,
     ctx: ParseContext<'_>,

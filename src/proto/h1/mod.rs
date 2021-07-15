@@ -32,7 +32,8 @@ pub(crate) trait Http1Transaction {
     type Incoming;
     type Outgoing: Default;
     const LOG: &'static str;
-    /// 返回从bytes中解析出Http Request相关的header信息
+    /// 返回从bytes中解析出Http Request相关的header信息如requestline,keepalive,headers_len等
+    /// 与server相关的必要信息
     fn parse(bytes: &mut BytesMut, ctx: ParseContext<'_>) -> ParseResult<Self::Incoming>;
     fn encode(enc: Encode<'_, Self::Outgoing>, dst: &mut Vec<u8>) -> crate::Result<Encoder>;
 
