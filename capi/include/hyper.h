@@ -207,6 +207,8 @@ typedef int (*hyper_body_foreach_callback)(void*, const struct hyper_buf*);
 
 typedef int (*hyper_body_data_callback)(void*, struct hyper_context*, struct hyper_buf**);
 
+typedef void (*hyper_request_on_informational_callback)(void*, struct hyper_response*);
+
 typedef int (*hyper_headers_foreach_callback)(void*, const uint8_t*, size_t, const uint8_t*, size_t);
 
 typedef size_t (*hyper_io_read_callback)(void*, struct hyper_context*, uint8_t*, size_t);
@@ -297,6 +299,8 @@ void hyper_body_set_data_func(struct hyper_body *body, hyper_body_data_callback 
 
  This makes an owned copy of the bytes, so the `buf` argument can be
  freed or changed afterwards.
+
+ This returns `NULL` if allocating a new buffer fails.
  */
 struct hyper_buf *hyper_buf_copy(const uint8_t *buf, size_t len);
 
@@ -350,6 +354,22 @@ void hyper_clientconn_free(struct hyper_clientconn *conn);
  Creates a new set of HTTP clientconn options to be used in a handshake.
  */
 struct hyper_clientconn_options *hyper_clientconn_options_new(void);
+
+/*
+ Set the whether or not header case is preserved.
+
+ Pass `0` to allow lowercase normalization (default), `1` to retain original case.
+ */
+void hyper_clientconn_options_set_preserve_header_case(struct hyper_clientconn_options *opts,
+                                                       int enabled);
+
+/*
+ Set the whether or not header order is preserved.
+
+ Pass `0` to allow reordering (default), `1` to retain original ordering.
+ */
+void hyper_clientconn_options_set_preserve_header_order(struct hyper_clientconn_options *opts,
+                                                        int enabled);
 
 /*
  Free a `hyper_clientconn_options *`.
@@ -421,10 +441,40 @@ enum hyper_code hyper_request_set_method(struct hyper_request *req,
 
 /*
  Set the URI of the request.
+
+ The request's URI is best described as the `request-target` from the RFCs. So in HTTP/1,
+ whatever is set will get sent as-is in the first line (GET $uri HTTP/1.1). It
+ supports the 4 defined variants, origin-form, absolute-form, authority-form, and
+ asterisk-form.
+
+ The underlying type was built to efficiently support HTTP/2 where the request-target is
+ split over :scheme, :authority, and :path. As such, each part can be set explicitly, or the
+ type can parse a single contiguous string and if a scheme is found, that slot is "set". If
+ the string just starts with a path, only the path portion is set. All pseudo headers that
+ have been parsed/set are sent when the connection type is HTTP/2.
+
+ To set each slot explicitly, use `hyper_request_set_uri_parts`.
  */
 enum hyper_code hyper_request_set_uri(struct hyper_request *req,
                                       const uint8_t *uri,
                                       size_t uri_len);
+
+/*
+ Set the URI of the request with separate scheme, authority, and
+ path/query strings.
+
+ Each of `scheme`, `authority`, and `path_and_query` should either be
+ null, to skip providing a component, or point to a UTF-8 encoded
+ string. If any string pointer argument is non-null, its corresponding
+ `len` parameter must be set to the string's length.
+ */
+enum hyper_code hyper_request_set_uri_parts(struct hyper_request *req,
+                                            const uint8_t *scheme,
+                                            size_t scheme_len,
+                                            const uint8_t *authority,
+                                            size_t authority_len,
+                                            const uint8_t *path_and_query,
+                                            size_t path_and_query_len);
 
 /*
  Set the preferred HTTP version of the request.
@@ -453,6 +503,27 @@ struct hyper_headers *hyper_request_headers(struct hyper_request *req);
  free it after setting it on the request.
  */
 enum hyper_code hyper_request_set_body(struct hyper_request *req, struct hyper_body *body);
+
+/*
+ Set an informational (1xx) response callback.
+
+ The callback is called each time hyper receives an informational (1xx)
+ response for this request.
+
+ The third argument is an opaque user data pointer, which is passed to
+ the callback each time.
+
+ The callback is passed the `void *` data pointer, and a
+ `hyper_response *` which can be inspected as any other response. The
+ body of the response will always be empty.
+
+ NOTE: The `hyper_response *` is just borrowed data, and will not
+ be valid after the callback finishes. You must copy any data you wish
+ to persist.
+ */
+enum hyper_code hyper_request_on_informational(struct hyper_request *req,
+                                               hyper_request_on_informational_callback callback,
+                                               void *data);
 
 /*
  Free an HTTP response after using it.
@@ -695,7 +766,9 @@ struct hyper_waker *hyper_context_waker(struct hyper_context *cx);
 void hyper_waker_free(struct hyper_waker *waker);
 
 /*
- Free a waker that hasn't been woken.
+ Wake up the task associated with a waker.
+
+ NOTE: This consumes the waker. You should not use or free the waker afterwards.
  */
 void hyper_waker_wake(struct hyper_waker *waker);
 

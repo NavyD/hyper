@@ -91,6 +91,7 @@
 //! use std::net::SocketAddr;
 //! use hyper::{Body, Request, Response, Server};
 //! use hyper::service::{make_service_fn, service_fn};
+//! # #[cfg(feature = "runtime")]
 //! use hyper::server::conn::AddrStream;
 //!
 //! #[derive(Clone)]
@@ -148,20 +149,24 @@
 //! [`tower::make::Shared`]: https://docs.rs/tower/latest/tower/make/struct.Shared.html
 
 pub mod accept;
-// mod server;
+pub mod conn;
+#[cfg(feature = "tcp")]
+mod tcp;
+
+pub use self::server::Server;
 
 cfg_feature! {
     #![any(feature = "http1", feature = "http2")]
 
-    pub use self::server::{Builder, Server};
+    pub(crate) mod server;
+    pub use self::server::Builder;
 
-    pub mod conn;
-    mod server;
     mod shutdown;
+}
 
-    cfg_feature! {
-        #![feature = "tcp"]
+cfg_feature! {
+    #![not(any(feature = "http1", feature = "http2"))]
 
-        mod tcp;
-    }
+    mod server_stub;
+    use server_stub as server;
 }

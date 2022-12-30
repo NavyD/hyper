@@ -1,6 +1,6 @@
 [package]
 name = "hyper"
-version = "0.14.10" # don't forget to update html_root_url
+version = "0.14.23"
 description = "A fast and correct HTTP library."
 readme = "README.md"
 homepage = "https://hyper.rs"
@@ -19,9 +19,6 @@ include = [
   #"build.rs",
 ]
 
-[lib]
-crate-type = ["lib", "staticlib", "cdylib"]
-
 [dependencies]
 bytes = "1"
 futures-core = { version = "0.3", default-features = false }
@@ -30,9 +27,9 @@ futures-util = { version = "0.3", default-features = false }
 http = "0.2"
 http-body = "0.4"
 httpdate = "1.0"
-httparse = "1.4"
-h2 = { version = "0.3.3", optional = true }
-itoa = "0.4.1"
+httparse = "1.8"
+h2 = { version = "0.3.9", optional = true }
+itoa = "1"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 pin-project-lite = "0.2.4"
 tower-service = "0.3"
@@ -42,7 +39,7 @@ want = "0.3"
 # Optional
 
 libc = { version = "0.2", optional = true }
-socket2 = { version = "0.4", optional = true }
+socket2 = { version = "0.4.7", optional = true, features = ["all"] }
 
 [dev-dependencies]
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
@@ -50,8 +47,7 @@ matches = "0.1"
 num_cpus = "1.0"
 pretty_env_logger = "0.4"
 spmc = "0.3"
-serde = "1.0"
-serde_derive = "1.0"
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = [
     "fs",
@@ -65,9 +61,8 @@ tokio = { version = "1", features = [
     "test-util",
 ] }
 tokio-test = "0.4"
-tokio-util = { version = "0.6", features = ["codec"] }
-tower = { version = "0.4", features = ["make"] }
-tower-util = "0.3"
+tokio-util = { version = "0.7", features = ["codec"] }
+tower = { version = "0.4", features = ["make", "util"] }
 url = "2.2"
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies]
@@ -102,6 +97,7 @@ stream = []
 runtime = [
     "tcp",
     "tokio/rt",
+    "tokio/time",
 ]
 tcp = [
     "socket2",

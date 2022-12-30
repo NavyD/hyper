@@ -1,6 +1,7 @@
 #![deny(warnings)]
 #![deny(rust_2018_idioms)]
 
+use std::convert::TryInto;
 use std::future::Future;
 use std::io::{self, Read, Write};
 use std::net::TcpListener as StdTcpListener;
@@ -361,6 +362,53 @@ mod response_body_lengths {
         assert_eq!(res.headers().get("content-length").unwrap(), "10");
         assert_eq!(res.body().size_hint().exact(), Some(10));
     }
+
+    #[tokio::test]
+    async fn http2_implicit_empty_size_hint() {
+        use http_body::Body;
+
+        let server = serve();
+        let addr_str = format!("http://{}", server.addr());
+        server.reply();
+
+        let client = Client::builder()
+            .http2_only(true)
+            .build_http::<hyper::Body>();
+        let uri = addr_str
+            .parse::<hyper::Uri>()
+            .expect("server addr should parse");
+
+        let res = client.get(uri).await.unwrap();
+        assert_eq!(res.headers().get("content-length"), None);
+        assert_eq!(res.body().size_hint().exact(), Some(0));
+    }
+}
+
+#[test]
+fn get_response_custom_reason_phrase() {
+    let _ = pretty_env_logger::try_init();
+    let server = serve();
+    server.reply().reason_phrase("Cool");
+    let mut req = connect(server.addr());
+    req.write_all(
+        b"\
+        GET / HTTP/1.1\r\n\
+        Host: example.domain\r\n\
+        Connection: close\r\n\
+        \r\n\
+    ",
+    )
+    .unwrap();
+
+    let mut response = String::new();
+    req.read_to_string(&mut response).unwrap();
+
+    let mut lines = response.lines();
+    assert_eq!(lines.next(), Some("HTTP/1.1 200 Cool"));
+
+    let mut lines = lines.skip_while(|line| !line.is_empty());
+    assert_eq!(lines.next(), Some(""));
+    assert_eq!(lines.next(), None);
 }
 
 #[test]
@@ -832,6 +880,39 @@ fn expect_continue_sends_100() {
 }
 
 #[test]
+fn expect_continue_accepts_upper_cased_expectation() {
+    let server = serve();
+    let mut req = connect(server.addr());
+    server.reply();
+
+    req.write_all(
+        b"\
+        POST /foo HTTP/1.1\r\n\
+        Host: example.domain\r\n\
+        Expect: 100-Continue\r\n\
+        Content-Length: 5\r\n\
+        Connection: Close\r\n\
+        \r\n\
+    ",
+    )
+    .expect("write 1");
+
+    let msg = b"HTTP/1.1 100 Continue\r\n\r\n";
+    let mut buf = vec![0; msg.len()];
+    req.read_exact(&mut buf).expect("read 1");
+    assert_eq!(buf, msg);
+
+    let msg = b"hello";
+    req.write_all(msg).expect("write 2");
+
+    let mut body = String::new();
+    req.read_to_string(&mut body).expect("read 2");
+
+    let body = server.body();
+    assert_eq!(body, msg);
+}
+
+#[test]
 fn expect_continue_but_no_body_is_ignored() {
     let server = serve();
     let mut req = connect(server.addr());
@@ -1019,6 +1100,23 @@ fn http_10_request_receives_http_10_response() {
     .unwrap();
 
     let expected = "HTTP/1.0 200 OK\r\ncontent-length: 0\r\n";
+    let mut buf = [0; 256];
+    let n = req.read(&mut buf).unwrap();
+    assert!(n >= expected.len(), "read: {:?} >= {:?}", n, expected.len());
+    assert_eq!(s(&buf[..expected.len()]), expected);
+}
+
+#[test]
+fn http_11_uri_too_long() {
+    let server = serve();
+
+    let long_path = "a".repeat(65534);
+    let request_line = format!("GET /{} HTTP/1.1\r\n\r\n", long_path);
+
+    let mut req = connect(server.addr());
+    req.write_all(request_line.as_bytes()).unwrap();
+
+    let expected = "HTTP/1.1 414 URI Too Long\r\ncontent-length: 0\r\n";
     let mut buf = [0; 256];
     let n = req.read(&mut buf).unwrap();
     assert!(n >= expected.len(), "read: {:?} >= {:?}", n, expected.len());
@@ -1259,6 +1357,127 @@ fn header_name_too_long() {
     let mut buf = [0; 1024];
     let n = req.read(&mut buf).unwrap();
     assert!(s(&buf[..n]).starts_with("HTTP/1.1 431 Request Header Fields Too Large\r\n"));
+}
+
+#[tokio::test]
+async fn header_read_timeout_slow_writes() {
+    let listener = tcp_bind(&"127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    thread::spawn(move || {
+        let mut tcp = connect(&addr);
+        tcp.write_all(
+            b"\
+            GET / HTTP/1.1\r\n\
+        ",
+        )
+        .expect("write 1");
+        thread::sleep(Duration::from_secs(3));
+        tcp.write_all(
+            b"\
+            Something: 1\r\n\
+            \r\n\
+        ",
+        )
+        .expect("write 2");
+        thread::sleep(Duration::from_secs(6));
+        tcp.write_all(
+            b"\
+            Works: 0\r\n\
+        ",
+        )
+        .expect_err("write 3");
+    });
+
+    let (socket, _) = listener.accept().await.unwrap();
+    let conn = Http::new()
+        .http1_header_read_timeout(Duration::from_secs(5))
+        .serve_connection(
+            socket,
+            service_fn(|_| {
+                let res = Response::builder()
+                    .status(200)
+                    .body(hyper::Body::empty())
+                    .unwrap();
+                future::ready(Ok::<_, hyper::Error>(res))
+            }),
+        );
+    conn.without_shutdown().await.expect_err("header timeout");
+}
+
+#[tokio::test]
+async fn header_read_timeout_slow_writes_multiple_requests() {
+    let listener = tcp_bind(&"127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    thread::spawn(move || {
+        let mut tcp = connect(&addr);
+
+        tcp.write_all(
+            b"\
+            GET / HTTP/1.1\r\n\
+        ",
+        )
+        .expect("write 1");
+        thread::sleep(Duration::from_secs(3));
+        tcp.write_all(
+            b"\
+            Something: 1\r\n\
+            \r\n\
+        ",
+        )
+        .expect("write 2");
+
+        thread::sleep(Duration::from_secs(3));
+
+        tcp.write_all(
+            b"\
+            GET / HTTP/1.1\r\n\
+        ",
+        )
+        .expect("write 3");
+        thread::sleep(Duration::from_secs(3));
+        tcp.write_all(
+            b"\
+            Something: 1\r\n\
+            \r\n\
+        ",
+        )
+        .expect("write 4");
+
+        thread::sleep(Duration::from_secs(6));
+
+        tcp.write_all(
+            b"\
+            GET / HTTP/1.1\r\n\
+            Something: 1\r\n\
+            \r\n\
+        ",
+        )
+        .expect("write 5");
+        thread::sleep(Duration::from_secs(6));
+        tcp.write_all(
+            b"\
+            Works: 0\r\n\
+        ",
+        )
+        .expect_err("write 6");
+    });
+
+    let (socket, _) = listener.accept().await.unwrap();
+    let conn = Http::new()
+        .http1_header_read_timeout(Duration::from_secs(5))
+        .serve_connection(
+            socket,
+            service_fn(|_| {
+                let res = Response::builder()
+                    .status(200)
+                    .body(hyper::Body::empty())
+                    .unwrap();
+                future::ready(Ok::<_, hyper::Error>(res))
+            }),
+        );
+    conn.without_shutdown().await.expect_err("header timeout");
 }
 
 #[tokio::test]
@@ -2230,6 +2449,26 @@ fn skips_content_length_and_body_for_304_responses() {
     assert_eq!(lines.next(), None);
 }
 
+#[test]
+fn no_implicit_zero_content_length_for_head_responses() {
+    let server = serve();
+    server.reply().status(hyper::StatusCode::OK).body([]);
+    let mut req = connect(server.addr());
+    req.write_all(
+        b"\
+        HEAD / HTTP/1.1\r\n\
+        Host: example.domain\r\n\
+        Connection: close\r\n\
+        \r\n\
+    ",
+    )
+    .unwrap();
+
+    let mut response = String::new();
+    req.read_to_string(&mut response).unwrap();
+    assert!(!response.contains("content-length:"));
+}
+
 #[tokio::test]
 async fn http2_keep_alive_detects_unresponsive_client() {
     let _ = pretty_env_logger::try_init();
@@ -2460,6 +2699,17 @@ impl<'a> ReplyBuilder<'a> {
         self
     }
 
+    fn reason_phrase(self, reason: &str) -> Self {
+        self.tx
+            .lock()
+            .unwrap()
+            .send(Reply::ReasonPhrase(
+                reason.as_bytes().try_into().expect("reason phrase"),
+            ))
+            .unwrap();
+        self
+    }
+
     fn version(self, version: hyper::Version) -> Self {
         self.tx
             .lock()
@@ -2533,6 +2783,7 @@ struct TestService {
 #[derive(Debug)]
 enum Reply {
     Status(hyper::StatusCode),
+    ReasonPhrase(hyper::ext::ReasonPhrase),
     Version(hyper::Version),
     Header(HeaderName, HeaderValue),
     Body(hyper::Body),
@@ -2587,6 +2838,9 @@ impl TestService {
             match reply {
                 Reply::Status(s) => {
                     *res.status_mut() = s;
+                }
+                Reply::ReasonPhrase(reason) => {
+                    res.extensions_mut().insert(reason);
                 }
                 Reply::Version(v) => {
                     *res.version_mut() = v;

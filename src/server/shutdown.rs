@@ -2,9 +2,11 @@ use std::error::Error as StdError;
 
 use pin_project_lite::pin_project;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tracing::debug;
 
 use super::accept::Accept;
-use super::conn::{SpawnAll, UpgradeableConnection, Watcher};
+use super::conn::UpgradeableConnection;
+use super::server::{Server, Watcher};
 use crate::body::{Body, HttpBody};
 use crate::common::drain::{self, Draining, Signal, Watch, Watching};
 use crate::common::exec::{ConnStreamExec, NewSvcExec};
@@ -25,7 +27,7 @@ pin_project! {
         Running {
             drain: Option<(Signal, Watch)>,
             #[pin]
-            spawn_all: SpawnAll<I, S, E>,
+            server: Server<I, S, E>,
             #[pin]
             signal: F,
         },
@@ -34,12 +36,12 @@ pin_project! {
 }
 
 impl<I, S, F, E> Graceful<I, S, F, E> {
-    pub(super) fn new(spawn_all: SpawnAll<I, S, E>, signal: F) -> Self {
+    pub(super) fn new(server: Server<I, S, E>, signal: F) -> Self {
         let drain = Some(drain::channel());
         Graceful {
             state: State::Running {
                 drain,
-                spawn_all,
+                server,
                 signal,
             },
         }
@@ -53,7 +55,7 @@ where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     S: MakeServiceRef<IO, Body, ResBody = B>,
     S::Error: Into<Box<dyn StdError + Send + Sync>>,
-    B: HttpBody + Send + Sync + 'static,
+    B: HttpBody + 'static,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
     F: Future<Output = ()>,
     E: ConnStreamExec<<S::Service as HttpService<Body>>::Future, B>,
@@ -68,7 +70,7 @@ where
                 match me.state.as_mut().project() {
                     StateProj::Running {
                         drain,
-                        spawn_all,
+                        server,
                         signal,
                     } => match signal.poll(cx) {
                         Poll::Ready(()) => {
@@ -80,7 +82,7 @@ where
                         }
                         Poll::Pending => {
                             let watch = drain.as_ref().expect("drain channel").1.clone();
-                            return spawn_all.poll_watch(cx, &GracefulWatcher(watch));
+                            return server.poll_watch(cx, &GracefulWatcher(watch));
                         }
                     },
                     StateProj::Draining { ref mut draining } => {
@@ -102,7 +104,7 @@ where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     S: HttpService<Body>,
     E: ConnStreamExec<S::Future, S::ResBody>,
-    S::ResBody: Send + Sync + 'static,
+    S::ResBody: 'static,
     <S::ResBody as HttpBody>::Error: Into<Box<dyn StdError + Send + Sync>>,
 {
     type Future =
@@ -118,7 +120,7 @@ where
     S: HttpService<Body>,
     S::Error: Into<Box<dyn StdError + Send + Sync>>,
     I: AsyncRead + AsyncWrite + Unpin,
-    S::ResBody: HttpBody + Send + 'static,
+    S::ResBody: HttpBody + 'static,
     <S::ResBody as HttpBody>::Error: Into<Box<dyn StdError + Send + Sync>>,
     E: ConnStreamExec<S::Future, S::ResBody>,
 {

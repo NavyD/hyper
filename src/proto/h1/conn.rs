@@ -1,12 +1,17 @@
 use std::fmt;
 use std::io;
 use std::marker::PhantomData;
+#[cfg(all(feature = "server", feature = "runtime"))]
+use std::time::Duration;
 
 use bytes::{Buf, Bytes};
 use http::header::{HeaderValue, CONNECTION};
 use http::{HeaderMap, Method, Version};
 use httparse::ParserConfig;
 use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(all(feature = "server", feature = "runtime"))]
+use tokio::time::Sleep;
+use tracing::{debug, error, trace};
 
 use super::io::Buffered;
 use super::{Decoder, Encode, EncodedBuf, Encoder, Http1Transaction, ParseContext, Wants};
@@ -46,9 +51,19 @@ where
                 keep_alive: KA::Busy,
                 method: None,
                 h1_parser_config: ParserConfig::default(),
+                #[cfg(all(feature = "server", feature = "runtime"))]
+                h1_header_read_timeout: None,
+                #[cfg(all(feature = "server", feature = "runtime"))]
+                h1_header_read_timeout_fut: None,
+                #[cfg(all(feature = "server", feature = "runtime"))]
+                h1_header_read_timeout_running: false,
                 preserve_header_case: false,
+                #[cfg(feature = "ffi")]
+                preserve_header_order: false,
                 title_case_headers: false,
                 h09_responses: false,
+                #[cfg(feature = "ffi")]
+                on_informational: None,
                 #[cfg(feature = "ffi")]
                 raw_headers: false,
                 notify_read: false,
@@ -68,6 +83,10 @@ where
         self.io.set_flush_pipeline(enabled);
     }
 
+    pub(crate) fn set_write_strategy_queue(&mut self) {
+        self.io.set_write_strategy_queue();
+    }
+
     pub(crate) fn set_max_buf_size(&mut self, max: usize) {
         self.io.set_max_buf_size(max);
     }
@@ -75,6 +94,10 @@ where
     #[cfg(feature = "client")]
     pub(crate) fn set_read_buf_exact_size(&mut self, sz: usize) {
         self.io.set_read_buf_exact_size(sz);
+    }
+
+    pub(crate) fn set_write_strategy_flatten(&mut self) {
+        self.io.set_write_strategy_flatten();
     }
 
     #[cfg(feature = "client")]
@@ -90,9 +113,19 @@ where
         self.state.preserve_header_case = true;
     }
 
+    #[cfg(feature = "ffi")]
+    pub(crate) fn set_preserve_header_order(&mut self) {
+        self.state.preserve_header_order = true;
+    }
+
     #[cfg(feature = "client")]
     pub(crate) fn set_h09_responses(&mut self) {
         self.state.h09_responses = true;
+    }
+
+    #[cfg(all(feature = "server", feature = "runtime"))]
+    pub(crate) fn set_http1_header_read_timeout(&mut self, val: Duration) {
+        self.state.h1_header_read_timeout = Some(val);
     }
 
     #[cfg(feature = "server")]
@@ -123,19 +156,15 @@ where
 
     /// 当reading为init且 是server时 或writing不是init时返回true
     pub(crate) fn can_read_head(&self) -> bool {
-        match self.state.reading {
-            Reading::Init => {
-                if T::should_read_first() {
-                    true
-                } else {
-                    match self.state.writing {
-                        Writing::Init => false,
-                        _ => true,
-                    }
-                }
-            }
-            _ => false,
+        if !matches!(self.state.reading, Reading::Init) {
+            return false;
         }
+
+        if T::should_read_first() {
+            return true;
+        }
+
+        !matches!(self.state.writing, Writing::Init)
     }
 
     /// 当reading为被设置了Decoder的body,continue时返回true
@@ -171,8 +200,18 @@ where
                 cached_headers: &mut self.state.cached_headers,
                 req_method: &mut self.state.method,
                 h1_parser_config: self.state.h1_parser_config.clone(),
+                #[cfg(all(feature = "server", feature = "runtime"))]
+                h1_header_read_timeout: self.state.h1_header_read_timeout,
+                #[cfg(all(feature = "server", feature = "runtime"))]
+                h1_header_read_timeout_fut: &mut self.state.h1_header_read_timeout_fut,
+                #[cfg(all(feature = "server", feature = "runtime"))]
+                h1_header_read_timeout_running: &mut self.state.h1_header_read_timeout_running,
                 preserve_header_case: self.state.preserve_header_case,
+                #[cfg(feature = "ffi")]
+                preserve_header_order: self.state.preserve_header_order,
                 h09_responses: self.state.h09_responses,
+                #[cfg(feature = "ffi")]
+                on_informational: &mut self.state.on_informational,
                 #[cfg(feature = "ffi")]
                 raw_headers: self.state.raw_headers,
             }
@@ -188,6 +227,12 @@ where
 
         // Prevent accepting HTTP/0.9 responses after the initial one, if any.
         self.state.h09_responses = false;
+
+        // Drop any OnInformational callbacks, we're done there!
+        #[cfg(feature = "ffi")]
+        {
+            self.state.on_informational = None;
+        }
 
         self.state.busy();
         self.state.keep_alive &= msg.keep_alive;
@@ -324,10 +369,10 @@ where
     }
 
     fn is_mid_message(&self) -> bool {
-        match (&self.state.reading, &self.state.writing) {
-            (&Reading::Init, &Writing::Init) => false,
-            _ => true,
-        }
+        !matches!(
+            (&self.state.reading, &self.state.writing),
+            (&Reading::Init, &Writing::Init)
+        )
     }
 
     // This will check to make sure the io object read is empty.
@@ -451,13 +496,12 @@ where
 
     /// 当writing==init时且 除了作为client reading==closed时 返回true
     pub(crate) fn can_write_head(&self) -> bool {
-        if !T::should_read_first() {
-            if let Reading::Closed = self.state.reading {
-                return false;
-            }
+        if !T::should_read_first() && matches!(self.state.reading, Reading::Closed) {
+            return false;
         }
+
         match self.state.writing {
-            Writing::Init => true,
+            Writing::Init => self.io.can_headers_buf(),
             _ => false,
         }
     }
@@ -533,6 +577,13 @@ where
                 debug_assert!(self.state.cached_headers.is_none());
                 debug_assert!(head.headers.is_empty());
                 self.state.cached_headers = Some(head.headers);
+
+                #[cfg(feature = "ffi")]
+                {
+                    self.state.on_informational =
+                        head.extensions.remove::<crate::ffi::OnInformational>();
+                }
+
                 Some(encoder)
             }
             Err(err) => {
@@ -543,7 +594,7 @@ where
         }
     }
 
-    // Fix keep-alives when Connection: keep-alive header is not present
+    // Fix keep-alive when Connection: keep-alive header is not present
     fn fix_keep_alive(&mut self, head: &mut MessageHead<T::Outgoing>) {
         let outgoing_is_keep_alive = head
             .headers
@@ -593,14 +644,14 @@ where
             Writing::Body(ref mut encoder) => {
                 self.io.buffer(encoder.encode(chunk));
 
-                if encoder.is_eof() {
-                    if encoder.is_last() {
-                        Writing::Closed
-                    } else {
-                        Writing::KeepAlive
-                    }
-                } else {
+                if !encoder.is_eof() {
                     return;
+                }
+
+                if encoder.is_last() {
+                    Writing::Closed
+                } else {
+                    Writing::KeepAlive
                 }
             }
             _ => unreachable!("write_body invalid state: {:?}", self.state.writing),
@@ -632,34 +683,31 @@ where
     pub(crate) fn end_body(&mut self) -> crate::Result<()> {
         debug_assert!(self.can_write_body());
 
-        let mut res = Ok(());
-        let state = match self.state.writing {
-            Writing::Body(ref mut encoder) => {
-                // end of stream, that means we should try to eof
-                match encoder.end() {
-                    Ok(end) => {
-                        if let Some(end) = end {
-                            self.io.buffer(end);
-                        }
-                        if encoder.is_last() || encoder.is_close_delimited() {
-                            Writing::Closed
-                        } else {
-                            Writing::KeepAlive
-                        }
-                    }
-                    Err(_not_eof) => {
-                        res = Err(crate::Error::new_user_body(
-                            crate::Error::new_body_write_aborted(),
-                        ));
-                        Writing::Closed
-                    }
-                }
-            }
+        let encoder = match self.state.writing {
+            Writing::Body(ref mut enc) => enc,
             _ => return Ok(()),
         };
 
-        self.state.writing = state;
-        res
+        // end of stream, that means we should try to eof
+        match encoder.end() {
+            Ok(end) => {
+                if let Some(end) = end {
+                    self.io.buffer(end);
+                }
+
+                self.state.writing = if encoder.is_last() || encoder.is_close_delimited() {
+                    Writing::Closed
+                } else {
+                    Writing::KeepAlive
+                };
+
+                Ok(())
+            }
+            Err(not_eof) => {
+                self.state.writing = Writing::Closed;
+                Err(crate::Error::new_body_write_aborted().with(not_eof))
+            }
+        }
     }
 
     // When we get a parse error, depending on what side we are, we might be able
@@ -712,10 +760,7 @@ where
 
         // If still in Reading::Body, just give up
         match self.state.reading {
-            Reading::Init | Reading::KeepAlive => {
-                trace!("body drained");
-                return;
-            }
+            Reading::Init | Reading::KeepAlive => trace!("body drained"),
             _ => self.close_read(),
         }
     }
@@ -780,9 +825,22 @@ struct State {
     /// a body or not.
     method: Option<Method>,
     h1_parser_config: ParserConfig,
+    #[cfg(all(feature = "server", feature = "runtime"))]
+    h1_header_read_timeout: Option<Duration>,
+    #[cfg(all(feature = "server", feature = "runtime"))]
+    h1_header_read_timeout_fut: Option<Pin<Box<Sleep>>>,
+    #[cfg(all(feature = "server", feature = "runtime"))]
+    h1_header_read_timeout_running: bool,
     preserve_header_case: bool,
+    #[cfg(feature = "ffi")]
+    preserve_header_order: bool,
     title_case_headers: bool,
     h09_responses: bool,
+    /// If set, called with each 1xx informational response received for
+    /// the current request. MUST be unset after a non-1xx response is
+    /// received.
+    #[cfg(feature = "ffi")]
+    on_informational: Option<crate::ffi::OnInformational>,
     #[cfg(feature = "ffi")]
     raw_headers: bool,
     /// Set to true when the Dispatcher should poll read operations
@@ -953,43 +1011,35 @@ impl State {
 
         self.method = None;
         self.keep_alive.idle();
-        if self.is_idle() {
-            self.reading = Reading::Init;
-            self.writing = Writing::Init;
 
-            // !T::should_read_first() means Client.
-            //
-            // If Client connection has just gone idle, the Dispatcher
-            // should try the poll loop one more time, so as to poll the
-            // pending requests stream.
-            if !T::should_read_first() {
-                self.notify_read = true;
-            }
-        } else {
+        if !self.is_idle() {
             self.close();
+            return;
+        }
+
+        self.reading = Reading::Init;
+        self.writing = Writing::Init;
+
+        // !T::should_read_first() means Client.
+        //
+        // If Client connection has just gone idle, the Dispatcher
+        // should try the poll loop one more time, so as to poll the
+        // pending requests stream.
+        if !T::should_read_first() {
+            self.notify_read = true;
         }
     }
 
     fn is_idle(&self) -> bool {
-        if let KA::Idle = self.keep_alive.status() {
-            true
-        } else {
-            false
-        }
+        matches!(self.keep_alive.status(), KA::Idle)
     }
 
     fn is_read_closed(&self) -> bool {
-        match self.reading {
-            Reading::Closed => true,
-            _ => false,
-        }
+        matches!(self.reading, Reading::Closed)
     }
 
     fn is_write_closed(&self) -> bool {
-        match self.writing {
-            Writing::Closed => true,
-            _ => false,
-        }
+        matches!(self.writing, Writing::Closed)
     }
 
     fn prepare_upgrade(&mut self) -> crate::upgrade::OnUpgrade {

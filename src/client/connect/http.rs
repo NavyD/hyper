@@ -14,6 +14,7 @@ use http::uri::{Scheme, Uri};
 use pin_project_lite::pin_project;
 use tokio::net::{TcpSocket, TcpStream};
 use tokio::time::Sleep;
+use tracing::{debug, trace, warn};
 
 use super::dns::{self, resolve, GaiResolver, Resolve};
 use super::{Connected, Connection};
@@ -65,6 +66,7 @@ pub struct HttpConnector<R = GaiResolver> {
 #[derive(Clone, Debug)]
 pub struct HttpInfo {
     remote_addr: SocketAddr,
+    local_addr: SocketAddr,
 }
 
 #[derive(Clone)]
@@ -325,6 +327,7 @@ where
         let config = &self.config;
 
         let (host, port) = get_host_port(config, &dst)?;
+        let host = host.trim_start_matches('[').trim_end_matches(']');
 
         // If the host is already an IP addr (v4 or v6),
         // skip resolving the dns and start connecting right away.
@@ -358,8 +361,8 @@ where
 impl Connection for TcpStream {
     fn connected(&self) -> Connected {
         let connected = Connected::new();
-        if let Ok(remote_addr) = self.peer_addr() {
-            connected.extra(HttpInfo { remote_addr })
+        if let (Ok(remote_addr), Ok(local_addr)) = (self.peer_addr(), self.local_addr()) {
+            connected.extra(HttpInfo { remote_addr, local_addr })
         } else {
             connected
         }
@@ -370,6 +373,11 @@ impl HttpInfo {
     /// Get the remote address of the transport used.
     pub fn remote_addr(&self) -> SocketAddr {
         self.remote_addr
+    }
+
+    /// Get the local address of the transport used.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
     }
 }
 
